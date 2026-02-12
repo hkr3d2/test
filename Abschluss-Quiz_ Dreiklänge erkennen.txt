@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Abschluss-Quiz: Dreiklänge erkennen</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Playfair+Display:wght@700;900&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #21262d;
+    --border: #30363d;
+    --dur: #2ea043;
+    --moll: #388bfd;
+    --verm: #d29922;
+    --ueber: #f85149;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #f78166;
+  }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+
+  .container { max-width: 900px; width: 100%; }
+
+  h1 {
+    font-family: 'Playfair Display', serif;
+    font-size: 2.2rem;
+    text-align: center;
+    margin-bottom: 5px;
+    color: var(--text);
+  }
+
+  .subtitle { color: var(--text-dim); text-align: center; margin-bottom: 20px; font-size: 0.95rem; }
+
+  .teacher-controls {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+
+  .teacher-controls h3 { font-size: 0.9rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; }
+
+  .control-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+
+  .ctrl-btn {
+    padding: 10px 20px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .ctrl-btn:hover { border-color: var(--accent); background: rgba(248, 129, 102, 0.1); }
+  .ctrl-btn.active { border-color: var(--accent); background: rgba(248, 129, 102, 0.15); color: var(--accent); }
+
+  .ctrl-btn.big {
+    padding: 14px 30px;
+    font-size: 1.05rem;
+    font-weight: 600;
+    background: linear-gradient(135deg, var(--accent), #d2691e);
+    border: none;
+    color: white;
+  }
+
+  .ctrl-btn.big:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(248, 129, 102, 0.3); }
+
+  /* Display Area */
+  .display-area {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 30px;
+    margin-bottom: 20px;
+    min-height: 280px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mode-label {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-bottom: 15px;
+  }
+
+  .question-number {
+    position: absolute;
+    top: 15px;
+    left: 20px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+
+  /* Staff notation via canvas */
+  #staffCanvas {
+    background: transparent;
+    margin: 10px 0;
+  }
+
+  /* Keyboard display */
+  .keyboard {
+    display: flex;
+    position: relative;
+    height: 140px;
+    margin: 15px 0;
+  }
+
+  .white-key {
+    width: 45px;
+    height: 140px;
+    background: #f0f0f0;
+    border: 1px solid #999;
+    border-radius: 0 0 5px 5px;
+    position: relative;
+    z-index: 1;
+    transition: background 0.2s;
+  }
+
+  .white-key.highlighted { background: var(--accent); border-color: #c55; }
+
+  .black-key {
+    width: 28px;
+    height: 85px;
+    background: #222;
+    border: 1px solid #000;
+    border-radius: 0 0 4px 4px;
+    position: absolute;
+    z-index: 2;
+    transition: background 0.2s;
+  }
+
+  .black-key.highlighted { background: var(--accent); }
+
+  .key-label {
+    position: absolute;
+    bottom: 5px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+    color: #888;
+  }
+
+  /* Play button for sound mode */
+  .sound-play-btn {
+    padding: 20px 50px;
+    background: linear-gradient(135deg, var(--surface2), #1a1a3e);
+    border: 2px solid var(--accent);
+    border-radius: 16px;
+    color: var(--accent);
+    font-size: 1.3rem;
+    font-family: 'DM Sans', sans-serif;
+    cursor: pointer;
+    transition: all 0.3s;
+  }
+
+  .sound-play-btn:hover {
+    background: rgba(248, 129, 102, 0.1);
+    transform: scale(1.03);
+  }
+
+  /* Color card answers */
+  .color-cards {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 15px;
+  }
+
+  .color-card {
+    padding: 18px 10px;
+    border-radius: 12px;
+    text-align: center;
+    font-weight: 700;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: all 0.3s;
+    border: 3px solid transparent;
+    opacity: 0.7;
+  }
+
+  .color-card:hover { opacity: 1; transform: translateY(-3px); }
+  .color-card.selected { opacity: 1; transform: scale(1.05); border-color: white; }
+
+  .card-dur { background: var(--dur); color: white; }
+  .card-moll { background: var(--moll); color: white; }
+  .card-verm { background: var(--verm); color: #111; }
+  .card-ueber { background: var(--ueber); color: white; }
+
+  /* Reveal */
+  .reveal-area {
+    text-align: center;
+    margin-top: 15px;
+    min-height: 40px;
+  }
+
+  .reveal-btn {
+    padding: 12px 30px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.95rem;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .reveal-btn:hover { border-color: var(--accent); }
+
+  .answer-reveal {
+    font-size: 1.5rem;
+    font-weight: 700;
+    animation: popIn 0.3s;
+  }
+
+  @keyframes popIn { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+  /* Score tracking */
+  .scoreboard {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    display: flex;
+    justify-content: space-around;
+    text-align: center;
+  }
+
+  .score-item { }
+  .score-item .label { font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+  .score-item .value { font-size: 1.8rem; font-weight: 700; color: var(--accent); }
+
+  .waiting-msg {
+    color: var(--text-dim);
+    font-size: 1.1rem;
+    font-style: italic;
+  }
+
+  @media (max-width: 600px) {
+    .color-cards { grid-template-columns: repeat(2, 1fr); }
+    .white-key { width: 32px; height: 110px; }
+    .black-key { width: 20px; height: 65px; }
+    h1 { font-size: 1.6rem; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<div class="container">
+  <h1>🎯 Abschluss-Quiz</h1>
+  <p class="subtitle">Dreiklänge erkennen – Notenbild, Klaviatur & Klang</p>
+
+  <!-- Teacher Controls -->
+  <div class="teacher-controls">
+    <h3>Steuerung (Lehrkraft)</h3>
+    <div class="control-row">
+      <span style="color:var(--text-dim); font-size:0.85rem; margin-right:5px;">Modus:</span>
+      <button class="ctrl-btn active" onclick="setMode('staff')" id="btn-staff">🎼 Notenbild</button>
+      <button class="ctrl-btn" onclick="setMode('keyboard')" id="btn-keyboard">🎹 Klaviatur</button>
+      <button class="ctrl-btn" onclick="setMode('sound')" id="btn-sound">🔊 Klang</button>
+      <button class="ctrl-btn" onclick="setMode('random')" id="btn-random">🎲 Zufall</button>
+    </div>
+    <div class="control-row">
+      <button class="ctrl-btn big" onclick="nextQstion()">▶ Nächste Aufgabe</button>
+      <button class="ctrl-btn" onclick="revealAnswer()">👁 Lösung zeigen</button>
+      <button class="ctrl-btn" onclick="resetQuiz()">↺ Zurücksetzen</button>
+    </div>
+  </div>
+
+  <!-- Display Area -->
+  <div class="display-area" id="display-area">
+    <p class="waiting-msg">Klicke auf „Nächste Aufgabe" um zu starten.</p>
+  </div>
+
+  <!-- Student answers via color cards -->
+  <div class="color-cards">
+    <div class="color-card card-dur" onclick="selectCard(this, 'dur')">🟢<br>DUR</div>
+    <div class="color-card card-moll" onclick="selectCard(this, 'moll')">🔵<br>MOLL</div>
+    <div class="color-card card-verm" onclick="selectCard(this, 'verm')">🟡<br>VERMINDERT</div>
+    <div class="color-card card-ueber" onclick="selectCard(this, 'ueber')">🔴<br>ÜBERMÄSSIG</div>
+  </div>
+
+  <div class="reveal-area" id="reveal-area"></div>
+
+  <!-- Scoreboard -->
+  <div class="scoreboard">
+    <div class="score-item">
+      <div class="label">Aufgabe</div>
+      <div class="value" id="q-count">0</div>
+    </div>
+    <div class="score-item">
+      <div class="label">Dur</div>
+      <div class="value" id="s-dur" style="color:var(--dur)">0</div>
+    </div>
+    <div class="score-item">
+      <div class="label">Moll</div>
+      <div class="value" id="s-moll" style="color:var(--moll)">0</div>
+    </div>
+    <div class="score-item">
+      <div class="label">Verm.</div>
+      <div class="value" id="s-verm" style="color:var(--verm)">0</div>
+    </div>
+    <div class="score-item">
+      <div class="label">Überm.</div>
+      <div class="value" id="s-ueber" style="color:var(--ueber)">0</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===== Audio =====
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function midiToFreq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
+
+function playNote(midi, startTime, duration, ctx, gain=0.22) {
+  const osc1 = ctx.createOscillator();
+  const osc2 = ctx.createOscillator();
+  const g = ctx.createGain();
+  const filt = ctx.createBiquadFilter();
+  osc1.type = 'triangle'; osc1.frequency.value = midiToFreq(midi);
+  osc2.type = 'sine'; osc2.frequency.value = midiToFreq(midi) * 2;
+  filt.type = 'lowpass'; filt.frequency.value = 2000;
+  osc1.connect(filt); osc2.connect(filt); filt.connect(g); g.connect(ctx.destination);
+  g.gain.setValueAtTime(0, startTime);
+  g.gain.linearRampToValueAtTime(gain, startTime + 0.02);
+  g.gain.exponentialRampToValueAtTime(gain * 0.5, startTime + 0.15);
+  g.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+  osc1.start(startTime); osc1.stop(startTime + duration);
+  osc2.start(startTime); osc2.stop(startTime + duration);
+}
+
+function playTriadSound(notes) {
+  const ctx = getAudioCtx();
+  const now = ctx.currentTime + 0.05;
+  // Arpeggio then chord
+  notes.forEach((n, i) => playNote(n, now + i * 0.3, 1.2, ctx));
+  const t = now + notes.length * 0.3 + 0.3;
+  notes.forEach(n => playNote(n, t, 2.0, ctx, 0.18));
+}
+
+// ===== Triad Data =====
+const TYPES = {
+  dur: { intervals: [0, 4, 7], name: 'Dur', color: 'var(--dur)' },
+  moll: { intervals: [0, 3, 7], name: 'Moll', color: 'var(--moll)' },
+  verm: { intervals: [0, 3, 6], name: 'Vermindert', color: 'var(--verm)' },
+  ueber: { intervals: [0, 4, 8], name: 'Übermäßig', color: 'var(--ueber)' }
+};
+
+const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'B', 'H'];
+
+function randomTriad() {
+  const typeKeys = Object.keys(TYPES);
+  const type = typeKeys[Math.floor(Math.random() * typeKeys.length)];
+  const rootMidi = 60 + Math.floor(Math.random() * 10); // C4 to A4
+  const notes = TYPES[type].intervals.map(i => rootMidi + i);
+  const rootName = NOTE_NAMES[rootMidi % 12];
+  return { type, notes, rootMidi, rootName };
+}
+
+// ===== State =====
+let currentMode = 'staff';
+let currentTriad = null;
+let questionCount = 0;
+let stats = { dur: 0, moll: 0, verm: 0, ueber: 0 };
+
+// ===== Mode =====
+function setMode(mode) {
+  currentMode = mode;
+  document.querySelectorAll('.teacher-controls .ctrl-btn:not(.big)').forEach(b => b.classList.remove('active'));
+  if (mode === 'random') {
+    document.getElementById('btn-random').classList.add('active');
+  } else {
+    document.getElementById('btn-' + mode).classList.add('active');
+  }
+}
+
+// ===== Draw Staff =====
+function drawStaff(canvas, notes, rootMidi) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width = 320;
+  const h = canvas.height = 180;
+  ctx.clearRect(0, 0, w, h);
+
+  const lineSpacing = 14;
+  const staffTop = 40;
+  const staffLeft = 50;
+  const staffRight = w - 30;
+
+  // Draw 5 lines
+  ctx.strokeStyle = '#8b949e';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 5; i++) {
+    const y = staffTop + i * lineSpacing;
+    ctx.beginPath();
+    ctx.moveTo(staffLeft, y);
+    ctx.lineTo(staffRight, y);
+    ctx.stroke();
+  }
+
+  // Treble clef (text)
+  ctx.font = '48px serif';
+  ctx.fillStyle = '#e6edf3';
+  ctx.fillText('𝄞', staffLeft + 2, staffTop + 4.2 * lineSpacing);
+
+  // Note positions: E4=bottom line (staffTop + 4*lineSpacing)
+  // Each staff position is half lineSpacing
+  // MIDI 64=E4=bottom line position
+  // 60=C4 (ledger line below)
+  
+  function midiToStaffY(midi) {
+    // Map MIDI to diatonic position
+    const noteInOctave = midi % 12;
+    const octave = Math.floor(midi / 12) - 5; // 0 at C4
+    const diatonicMap = [0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6]; // C C# D D# E F F# G G# A A# B
+    const diatonic = diatonicMap[noteInOctave] + octave * 7;
+    // E4 = diatonic 2 from C4 = bottom line
+    // Bottom line Y = staffTop + 4 * lineSpacing
+    const bottomLineY = staffTop + 4 * lineSpacing;
+    return bottomLineY - (diatonic - 2) * (lineSpacing / 2);
+  }
+
+  function hasAccidental(midi) {
+    const black = [1, 3, 6, 8, 10];
+    return black.includes(midi % 12);
+  }
+
+  const noteX = staffLeft + (staffRight - staffLeft) * 0.55;
+
+  // Draw ledger lines if needed
+  notes.forEach(midi => {
+    const y = midiToStaffY(midi);
+    const bottomStaff = staffTop + 4 * lineSpacing;
+    const topStaff = staffTop;
+    
+    // Below staff
+    if (y > bottomStaff) {
+      for (let ly = bottomStaff + lineSpacing; ly <= y + 1; ly += lineSpacing) {
+        const diatonicCheck = Math.round((bottomStaff - ly) / (lineSpacing / 2));
+        if (Math.abs(ly - y) < lineSpacing / 2 + 1 || (ly - bottomStaff) % lineSpacing < 1) {
+          ctx.beginPath();
+          ctx.moveTo(noteX - 16, ly);
+          ctx.lineTo(noteX + 16, ly);
+          ctx.stroke();
+        }
+      }
+    }
+    // Above staff
+    if (y < topStaff) {
+      for (let ly = topStaff - lineSpacing; ly >= y - 1; ly -= lineSpacing) {
+        ctx.beginPath();
+        ctx.moveTo(noteX - 16, ly);
+        ctx.lineTo(noteX + 16, ly);
+        ctx.stroke();
+      }
+    }
+  });
+
+  // Draw notes (whole notes)
+  notes.forEach(midi => {
+    const y = midiToStaffY(midi);
+    
+    // Note head
+    ctx.save();
+    ctx.translate(noteX, y);
+    ctx.rotate(-0.2);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 8, 5.5, 0, 0, Math.PI * 2);
+    ctx.fillStyle = '#e6edf3';
+    ctx.fill();
+    // Hollow
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 4.5, 3, 0, 0, Math.PI * 2);
+    ctx.fillStyle = '#161b22';
+    ctx.fill();
+    ctx.restore();
+
+    // Accidental
+    if (hasAccidental(midi)) {
+      ctx.font = 'bold 16px serif';
+      ctx.fillStyle = '#e6edf3';
+      ctx.fillText('♯', noteX - 20, y + 5);
+    }
+  });
+}
+
+// ===== Draw Keyboard =====
+function drawKeyboard(container, midiNotes) {
+  container.innerHTML = '';
+  const keyboard = document.createElement('div');
+  keyboard.className = 'keyboard';
+  keyboard.style.position = 'relative';
+  keyboard.style.display = 'inline-flex';
+
+  const whiteNotes = [60, 62, 64, 65, 67, 69, 71, 72, 74, 76]; // C4 to E5
+  const whiteLabels = ['C', 'D', 'E', 'F', 'G', 'A', 'H', 'C', 'D', 'E'];
+  
+  const blackInfo = [
+    { left: 0, midi: 61, label: 'C♯' },
+    { left: 1, midi: 63, label: 'D♯' },
+    { left: 3, midi: 66, label: 'F♯' },
+    { left: 4, midi: 68, label: 'G♯' },
+    { left: 5, midi: 70, label: 'B' },
+    { left: 7, midi: 73, label: 'C♯' },
+    { left: 8, midi: 75, label: 'D♯' },
+  ];
+
+  const keyWidth = 42;
+
+  // White keys
+  whiteNotes.forEach((midi, i) => {
+    const key = document.createElement('div');
+    key.className = 'white-key' + (midiNotes.includes(midi) ? ' highlighted' : '');
+    key.style.width = keyWidth + 'px';
+    const label = document.createElement('span');
+    label.className = 'key-label';
+    label.textContent = whiteLabels[i];
+    if (midiNotes.includes(midi)) label.style.color = '#fff';
+    key.appendChild(label);
+    keyboard.appendChild(key);
+  });
+
+  // Black keys
+  blackInfo.forEach(info => {
+    const key = document.createElement('div');
+    key.className = 'black-key' + (midiNotes.includes(info.midi) ? ' highlighted' : '');
+    key.style.left = ((info.left + 1) * keyWidth - 14) + 'px';
+    keyboard.appendChild(key);
+  });
+
+  container.appendChild(keyboard);
+}
+
+// ===== Quiz Logic =====
+function nextQuestion() {
+  currentTriad = randomTriad();
+  questionCount++;
+
+  document.getElementById('q-count').textContent = questionCount;
+
+  // Reset selection
+  document.querySelectorAll('.color-card').forEach(c => c.classList.remove('selected'));
+  document.getElementById('reveal-area').innerHTML = '';
+
+  // Choose display mode
+  let mode = currentMode;
+  if (mode === 'random') {
+    const modes = ['staff', 'keyboard', 'sound'];
+    mode = modes[Math.floor(Math.random() * modes.length)];
+  }
+
+  const area = document.getElementById('display-area');
+  area.innerHTML = '';
+
+  const label = document.createElement('div');
+  label.className = 'mode-label';
+
+  if (mode === 'staff') {
+    label.textContent = '🎼 Notenbild – Welcher Dreiklang?';
+    area.appendChild(label);
+    const canvas = document.createElement('canvas');
+    area.appendChild(canvas);
+    drawStaff(canvas, currentTriad.notes, currentTriad.rootMidi);
+  } else if (mode === 'keyboard') {
+    label.textContent = '🎹 Klaviatur – Welcher Dreiklang?';
+    area.appendChild(label);
+    const kbContainer = document.createElement('div');
+    area.appendChild(kbContainer);
+    drawKeyboard(kbContainer, currentTriad.notes);
+  } else {
+    label.textContent = '🔊 Klang – Welcher Dreiklang?';
+    area.appendChild(label);
+    const btn = document.createElement('button');
+    btn.className = 'sound-play-btn';
+    btn.innerHTML = '▶ Abspielen';
+    btn.onclick = () => playTriadSound(currentTriad.notes);
+    area.appendChild(btn);
+    // Auto-play
+    setTimeout(() => playTriadSound(currentTriad.notes), 300);
+  }
+}
+
+function selectCard(el, type) {
+  document.querySelectorAll('.color-card').forEach(c => c.classList.remove('selected'));
+  el.classList.add('selected');
+}
+
+function revealAnswer() {
+  if (!currentTriad) return;
+  
+  // 🔥 JETZT erst die Statistik für den TYP erhöhen!
+  stats[currentTriad.type]++;
+  
+  // Statistik-Anzeige aktualisieren
+  document.getElementById('s-dur').textContent = stats.dur;
+  document.getElementById('s-moll').textContent = stats.moll;
+  document.getElementById('s-verm').textContent = stats.verm;
+  document.getElementById('s-ueber').textContent = stats.ueber;
+  
+  const area = document.getElementById('reveal-area');
+  const info = TYPES[currentTriad.type];
+  const noteNames = currentTriad.notes.map(m => NOTE_NAMES[m % 12]);
+  area.innerHTML = `
+    <div class="answer-reveal" style="color:${info.color}">
+      ${info.name}-Dreiklang
+    </div>
+    <div style="color:var(--text-dim); margin-top:5px; font-size:0.9rem;">
+      ${currentTriad.rootName}-${info.name.toLowerCase()}: ${noteNames.join(' – ')}
+    </div>
+  `;
+}
+
+function resetQuiz() {
+  questionCount = 0;
+  stats = { dur: 0, moll: 0, verm: 0, ueber: 0 };
+  currentTriad = null;
+  document.getElementById('q-count').textContent = '0';
+  document.getElementById('s-dur').textContent = '0';
+  document.getElementById('s-moll').textContent = '0';
+  document.getElementById('s-verm').textContent = '0';
+  document.getElementById('s-ueber').textContent = '0';
+  document.getElementById('display-area').innerHTML = '<p class="waiting-msg">Klicke auf „Nächste Aufgabe" um zu starten.</p>';
+  document.getElementById('reveal-area').innerHTML = '';
+  document.querySelectorAll('.color-card').forEach(c => c.classList.remove('selected'));
+}
+</script>
+</body>
+</html>
